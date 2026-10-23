@@ -56,11 +56,16 @@ TcpServer::TcpServer(string ip_address , int port){
 
 }
 
+
+
+
 //Destructor
 TcpServer::~TcpServer(){
     close(server_fd);
     cout << "server socket closed" << endl;
 }
+
+
 
 void TcpServer::start(){
     cout << "Waiting for a connection ..." << endl ;
@@ -86,7 +91,45 @@ void TcpServer::start(){
         ssize_t bytes_read = recv(client_fd , buffer , sizeof(buffer)-1 , 0);
 
         if(bytes_read>0){
-            cout << "Client sent" << bytes_read << "bytes:\n" << endl;
+            cout << "Received requests from backend , forwarding to backend ..." << endl;
+
+            //The Proxy Logic
+            //grab a new socket to act as a client for our backend
+            int backend_fd = socket(AF_INET , SOCK_STREAM , 0);
+            if(backend_fd<0){
+                cerr << "Failed to create backend socket" << endl;
+                close(client_fd);
+                continue; //skip to the next client;
+            }
+
+            //Fill out the application form for node.js server
+            struct sockaddr_in backend_addr;
+            backend_addr.sin_family = AF_INET;
+            backend_addr.sin_port = htons(8081);
+            inet_pton(AF_INET , "127.0.0.1" , &backend_addr.sin_addr);
+
+            //Actually dial the backend server(equivalent to accept but for clients)
+            if(connect(backend_fd , (struct sockaddr*)&backend_addr , sizeof(backend_addr))<0){
+                cerr << "Failed to connect to backend , Is node.js running ? " << endl;
+                close(backend_fd);
+                close(client_fd);
+                continue;
+            }
+
+            //4.Send the exact bytes we got from curl directly into the backend pipe
+            send(backend_fd , buffer , bytes_read , 0);
+
+            //5.clean out the old data
+            memset(buffer , 0 ,sizeof(buffer));
+
+            //6.Read the node.js response back into our clean bucket
+            ssize_t backend_bytes_read = recv(backend_fd , buffer , sizeof(buffer)-1 , 0);
+            if(backend_bytes_read>0){
+                cout << "Received response from backend , forwarind it to client..." <<endl;
+                send(client_fd , buffer , backend_bytes_read ,0);
+            }
+            close(backend_fd);
+
             cout << buffer << endl;
         }
     
