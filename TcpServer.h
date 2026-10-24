@@ -4,6 +4,9 @@
 #include <string>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/event.h> //for kqueue and kevent
+#include <fcntl.h> //for making sockets non blocking
+
 
 using namespace std;
 
@@ -14,6 +17,7 @@ private:
     int port;
     int server_fd; //server_file descriptor ,  is a number (posix socket)
     struct sockaddr_in server_addr;
+    void make_socket_non_blocking(int fd);
 
 public:
     //Constructor to setup ip and port
