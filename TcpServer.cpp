@@ -7,9 +7,16 @@
 using namespace std ;
 
 //Constructor 
-TcpServer::TcpServer(string ip_address , int port){
+TcpServer::TcpServer(string ip_address , int port , RoutingStrategy strat){
+    this->strategy = strat;
     this->ip_address = ip_address;
     this->port = port;
+
+    backend_ports.push_back(8081);
+    backend_ports.push_back(8082);
+    backend_ports.push_back(8083);
+
+    current_backend = 0;
 
     //Creating a socket
     server_fd = socket(AF_INET , SOCK_STREAM , 0);
@@ -151,28 +158,109 @@ void TcpServer::start(){
                 }
 
             }
-
-            //Scenario 2 : An existing client send us data
+            //Scenario 2:Someone sent us data
             else if(event_list[i].filter == EVFILT_READ){
+                //Check if this is backend replying or a client requesting
+                if(backend_to_client.count(current_fd)>0){
 
-                //kqueue guarantees there is water in the bucket
-                char buffer[4096] = {0};
-                ssize_t bytes_read = recv(current_fd , buffer , sizeof(buffer) - 1 ,0);
+                    //Scenario 2a:backend sent us the response
+                    int client_fd = backend_to_client[current_fd];
+                    char buffer[4096] = {0};
+                    ssize_t backend_bytes = recv(current_fd , buffer , sizeof(buffer)-1,0);
 
-                if(bytes_read <= 0){
-                    //if recv returns 0 , the client hung up
-                    cout<<"Client Disconnected" << endl;
+                    if(backend_bytes > 0){
+                        cout << "Async response received from backend! Sending to client..." << endl;
+                        send(client_fd , buffer , backend_bytes,0);
+                    }
+                    //Hanging up both the phones and their corresponding map records
                     close(current_fd);
+                    close(client_fd);
+
+                    backend_to_client.erase(current_fd);
                 }
                 else{
-                    cout << "Read" << bytes_read << "here are the bytes from the client :\n " << endl;
-                    cout << buffer << endl;
+                    //Scenario 2b : new client that is in the event queue sent us request payload , previously already maintained connection , now payload is coming
 
-                    string fake_response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello Client!";
-                    send(current_fd, fake_response.c_str(), fake_response.size(), 0);
-                    close(current_fd);
+                    char buffer[4096] = {0};
+                    ssize_t bytes_read = recv(current_fd , buffer , sizeof(buffer)-1,0);
+
+                    if(bytes_read<=0){
+                        cout << "Client disconnected early" <<endl;
+                        close(current_fd);
+                        continue;
+                    }
+
+                    //Strategy Based Routing
+                    size_t start_index = 0;
+                    int total_backends = backend_ports.size();
+
+                    if(strategy == RoutingStrategy::IP_HASH){
+                        struct sockaddr_in peer_addr;
+                        socklen_t peer_len = sizeof(peer_addr);
+                        getpeername(current_fd , (struct sockaddr*)&peer_addr , &peer_len);
+
+                        char ip_str[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET ,&(peer_addr.sin_addr) , ip_str , INET_ADDRSTRLEN);
+
+                        hash<string>hasher;
+                        start_index = hasher(string(ip_str)) % total_backends;
+                    }
+                    else{
+                        start_index = current_backend;
+                        current_backend = (current_backend + 1)% total_backends;
+                    }
+
+                    //Fault tolerant Connection loop 
+                    int backend_fd = -1;
+                    bool connected = false;
+                    int attempts = 0;
+
+                    while(!connected && attempts < total_backends){
+                        int target_port = backend_ports[(start_index + attempts)% total_backends];
+
+                        backend_fd = socket(AF_INET , SOCK_STREAM,0);
+
+                        struct sockaddr_in backend_addr;
+                        backend_addr.sin_family = AF_INET;
+                        backend_addr.sin_port = htons(target_port);
+                        inet_pton(AF_INET , "127.0.0.1" , &backend_addr.sin_addr);
+
+                        if(connect(backend_fd , (struct sockaddr*)&backend_addr , sizeof(backend_addr))==0){
+                            connected = true;
+                            cout << "Async routing to port " << target_port << "..." <<endl;
+                        }
+                        else{
+                            close(backend_fd);
+                            attempts++;
+                        }
+                    }
+                    //after trying all the backends if no one is avalaible to take requests we send the client a bad gateway status
+                    if(!connected){
+                        string error_502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+                        send(current_fd , error_502.c_str() ,error_502.size() , 0 );
+                        close(current_fd);
+                        continue;
+                    }
+
+                    //Pour the request into backend pipe
+                    send(backend_fd , buffer , bytes_read ,0);
+
+                    //Make the backend non-blocking
+                    make_socket_non_blocking(backend_fd);
+
+                    //3.Hand the backend to kqueue to watch if something comes
+                    struct kevent backend_event;
+                    EV_SET(&backend_event , backend_fd , EVFILT_READ , EV_ADD | EV_ENABLE , 0 ,0 , NULL);
+                    if(kevent(kq , &backend_event ,1, NULL , 0 ,NULL)==-1){
+                        cerr << "Failed to add a new backend socket to kqueue" << endl;
+                    }
+
+                    //4.Save the relation in our dictionary
+                    backend_to_client[backend_fd] = current_fd;
                 }
             }
+
+            
             
         }
     }
